@@ -1,0 +1,606 @@
+# Advanced Options Engine v4.0 - Multi-Enhancement with Market Intelligence (FIXED)
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import datetime as dt
+from datetime import timedelta
+import random
+from scipy import stats
+from collections import defaultdict
+
+# --- Enhanced Settings ---
+stocks = ["TQQQ", "NVDA", "TSLA", "SPY", "HOOD", "PLTR", "SPOT", "META", "AMZN", "AA", "MSFT", "MS", "JPM", "CRM",
+          "AAPL", "AMD", "WMT", "MRVL", "LLY"]
+lookback_years = 3
+ideas_per_stock = 6
+
+# --- Market Intelligence ---
+VIX_THRESHOLD_LOW = 15  # Low fear = bullish for risk assets
+VIX_THRESHOLD_HIGH = 30  # High fear = bearish sentiment
+MARKET_INDICES = ["SPY", "QQQ", "IWM"]  # For market regime detection
+
+# --- Technical Settings ---
+sma_short, sma_mid, sma_long = 5, 10, 20
+rsi_period = 14
+macd_fast, macd_slow, macd_signal = 12, 26, 9
+min_option_price, max_option_price = 0.5, 4.00  # Expanded range
+min_liquidity_volume = 5  # Reduced for more options
+
+today = dt.datetime.now().date()
+
+
+class MarketRegimeDetector:
+    def __init__(self):
+        self.regime_cache = {}
+
+    def detect_regime(self):
+        """Detect current market regime: BULL, BEAR, SIDEWAYS, VOLATILE"""
+        try:
+            print("🔍 Detecting market regime...")
+
+            # Get VIX for fear/greed - try multiple approaches
+            vix = None
+            vix_success = False
+
+            for vix_symbol in ["^VIX", "VIX", "VIX.L"]:
+                try:
+                    print(f"🔄 Trying to fetch VIX data from {vix_symbol}...")
+                    vix_data = yf.download(vix_symbol, period="5d", interval="1d", progress=False)
+                    if not vix_data.empty and 'Close' in vix_data.columns:
+                        vix = float(vix_data['Close'].iloc[-1])
+                        print(f"✅ VIX data retrieved from {vix_symbol}: {vix:.2f}")
+                        vix_success = True
+                        break
+                except Exception as e:
+                    print(f"⚠️ Failed to get VIX from {vix_symbol}: {e}")
+                    continue
+
+            if not vix_success:
+                print("⚠️ All VIX sources failed, using market-based estimate")
+                # Estimate VIX from SPY volatility if direct VIX fails
+                try:
+                    spy_short = yf.download("SPY", period="10d", interval="1d", progress=False)
+                    if not spy_short.empty:
+                        spy_vol = spy_short['Close'].pct_change().rolling(5).std().iloc[-1] * np.sqrt(252) * 100
+                        vix = max(12, min(40, spy_vol))  # Reasonable VIX range
+                        print(f"📊 Estimated VIX from SPY volatility: {vix:.2f}")
+                    else:
+                        vix = 20.0
+                except:
+                    vix = 20.0
+
+            # Get major indices for trend
+            spy_data = yf.download("SPY", period="30d", interval="1d", progress=False)
+            if spy_data.empty:
+                print("⚠️ Using default SPY values")
+                spy_returns = 0.0
+                spy_vol = 0.20
+            else:
+                spy_returns = spy_data['Close'].pct_change(10).iloc[-1]  # 10-day return for more sensitivity
+                spy_vol = spy_data['Close'].pct_change().rolling(10).std().iloc[-1] * np.sqrt(252)
+                print(f"✅ SPY 10d return: {spy_returns * 100:.2f}%, Vol: {spy_vol * 100:.1f}%")
+
+            # Enhanced regime detection logic
+            print(f"🔍 Regime analysis: VIX={vix:.1f}, SPY_ret={spy_returns * 100:.1f}%, SPY_vol={spy_vol * 100:.1f}%")
+
+            # More nuanced regime classification
+            if vix > 30:  # High fear
+                regime = "VOLATILE" if spy_vol > 0.25 else "BEAR"
+            elif vix > 25:  # Moderate-high fear
+                regime = "VOLATILE" if spy_returns > -0.02 else "BEAR"
+            elif vix < 15:  # Low fear
+                regime = "BULL" if spy_returns > -0.02 else "SIDEWAYS"
+            elif vix < 20:  # Below average fear
+                if spy_returns > 0.03:
+                    regime = "BULL"
+                elif spy_returns < -0.03:
+                    regime = "BEAR"
+                else:
+                    regime = "SIDEWAYS"
+            else:  # VIX 20-25 range
+                if spy_returns > 0.02:
+                    regime = "NEUTRAL_BULL"
+                elif spy_returns < -0.02:
+                    regime = "NEUTRAL_BEAR"
+                else:
+                    regime = "NEUTRAL"
+
+            print(f"📊 Market regime determined: {regime}")
+
+            return {
+                'regime': regime,
+                'vix': round(vix, 2),
+                'spy_20d_return': round(spy_returns * 100, 2),
+                'market_vol': round(spy_vol * 100, 2)
+            }
+        except Exception as e:
+            print(f"❌ Market regime detection failed: {e}")
+            return {'regime': 'NEUTRAL', 'vix': 20, 'spy_20d_return': 0, 'market_vol': 20}
+
+
+class MultiTimeframeAnalyzer:
+    def __init__(self, data):
+        self.data = data
+        self.timeframes = [3, 5, 10, 15]  # Different forward-looking periods
+
+    def analyze_pattern_across_timeframes(self, similar_indices):
+        """Analyze pattern performance across multiple timeframes"""
+        results = {}
+
+        for tf in self.timeframes:
+            returns = []
+            for idx in similar_indices:
+                if idx in self.data.index:
+                    i = self.data.index.get_loc(idx)
+                    if i + tf < len(self.data):
+                        price_now = float(self.data['Close'].iloc[i].item())
+                        price_future = float(self.data['Close'].iloc[i + tf].item())
+                        ret = (price_future - price_now) / price_now
+                        returns.append(ret)
+
+            if returns:
+                results[f'{tf}d'] = {
+                    'avg_return': np.mean(returns),
+                    'win_rate': sum(1 for r in returns if r > 0) / len(returns),
+                    'volatility': np.std(returns),
+                    'sharpe': np.mean(returns) / (np.std(returns) + 1e-8),
+                    'max_return': max(returns),
+                    'min_return': min(returns)
+                }
+
+        return results
+
+
+class AdvancedConfidenceCalculator:
+    def __init__(self, market_regime):
+        self.market_regime = market_regime
+
+    def calculate_enhanced_confidence(self, timeframe_results, current_price, strike_price,
+                                      signal_type, days_to_expiry, avg_volatility, sector_strength=0.5):
+        """Enhanced confidence calculation with multiple factors"""
+
+        if not timeframe_results:
+            return 0.0, {}
+
+        # Find best matching timeframe based on days to expiry
+        best_tf = '5d'  # default
+        if days_to_expiry <= 7:
+            best_tf = '3d'
+        elif days_to_expiry <= 14:
+            best_tf = '5d'
+        elif days_to_expiry <= 30:
+            best_tf = '10d'
+        else:
+            best_tf = '15d'
+
+        if best_tf not in timeframe_results:
+            best_tf = list(timeframe_results.keys())[0]
+
+        tf_data = timeframe_results[best_tf]
+
+        # Base probability calculation
+        moneyness = abs(strike_price - current_price) / current_price
+
+        # Simulate future price distribution
+        expected_return = tf_data['avg_return']
+        expected_vol = tf_data['volatility']
+
+        # Monte Carlo simulation for option success probability
+        num_simulations = 1000
+        successes = 0
+
+        for _ in range(num_simulations):
+            # Random future price based on historical pattern
+            random_return = np.random.normal(expected_return, expected_vol)
+            future_price = current_price * (1 + random_return)
+
+            if signal_type == "CALL" and future_price >= strike_price:
+                successes += 1
+            elif signal_type == "PUT" and future_price <= strike_price:
+                successes += 1
+
+        base_probability = successes / num_simulations
+
+        # Market regime adjustments
+        regime_multiplier = self._get_regime_multiplier(signal_type)
+
+        # Time decay factor
+        time_factor = max(0.1, min(1.0, days_to_expiry / 30))
+
+        # Volatility factor (high vol helps OTM options)
+        vol_factor = 1 + (avg_volatility * 10 - 0.2) * moneyness
+
+        # Sharpe ratio bonus (consistent patterns get higher confidence)
+        sharpe_bonus = 1 + max(0, min(0.3, tf_data['sharpe'] / 2))
+
+        # Final confidence
+        final_confidence = (base_probability * regime_multiplier * time_factor *
+                            vol_factor * sharpe_bonus * (0.8 + 0.4 * sector_strength))
+
+        final_confidence = max(0.05, min(0.95, final_confidence))
+
+        # Detailed breakdown for analysis
+        breakdown = {
+            'base_prob': round(base_probability, 3),
+            'regime_mult': round(regime_multiplier, 3),
+            'time_factor': round(time_factor, 3),
+            'vol_factor': round(vol_factor, 3),
+            'sharpe_bonus': round(sharpe_bonus, 3),
+            'expected_return': round(expected_return * 100, 2),
+            'pattern_vol': round(expected_vol * 100, 2),
+            'pattern_sharpe': round(tf_data['sharpe'], 2)
+        }
+
+        return final_confidence, breakdown
+
+    def _get_regime_multiplier(self, signal_type):
+        """Adjust confidence based on market regime"""
+        regime = self.market_regime['regime']
+
+        multipliers = {
+            'BULL': {'CALL': 1.2, 'PUT': 0.8},
+            'BEAR': {'CALL': 0.8, 'PUT': 1.2},
+            'VOLATILE': {'CALL': 1.1, 'PUT': 1.1},  # High vol helps both
+            'SIDEWAYS': {'CALL': 0.9, 'PUT': 0.9},
+            'NEUTRAL': {'CALL': 1.0, 'PUT': 1.0},
+            'NEUTRAL_BULL': {'CALL': 1.1, 'PUT': 0.9},
+            'NEUTRAL_BEAR': {'CALL': 0.9, 'PUT': 1.1},
+            'UNKNOWN': {'CALL': 1.0, 'PUT': 1.0}
+        }
+
+        return multipliers.get(regime, {'CALL': 1.0, 'PUT': 1.0})[signal_type]
+
+
+class SectorAnalyzer:
+    def __init__(self):
+        self.sector_etfs = {
+            'TECH': 'XLK',
+            'FINANCIALS': 'XLF',
+            'HEALTHCARE': 'XLV',
+            'ENERGY': 'XLE',
+            'CONSUMER': 'XLY',
+            'UTILITIES': 'XLU',
+            'INDUSTRIALS': 'XLI',
+            'MATERIALS': 'XLB',
+            'REAL_ESTATE': 'XLRE',
+            'COMMUNICATIONS': 'XLC'
+        }
+        # Cache to avoid repeated downloads
+        self.sector_cache = {}
+        self.spy_cache = None
+
+    def get_sector_strength(self, ticker):
+        """Get relative sector strength - FIXED VERSION"""
+
+        # Enhanced sector mapping with more accurate classifications
+        sector_mapping = {
+            # Technology
+            'NVDA': 'TECH', 'AMD': 'TECH', 'MSFT': 'TECH', 'AAPL': 'TECH',
+            'META': 'TECH', 'CRM': 'TECH', 'MRVL': 'TECH', 'PLTR': 'TECH',
+            'TQQQ': 'TECH',  # 3x Tech ETF
+
+            # Communications/Media
+            'SPOT': 'COMMUNICATIONS',
+
+            # Consumer/E-commerce
+            'AMZN': 'CONSUMER', 'TSLA': 'CONSUMER', 'WMT': 'CONSUMER',
+
+            # Financials
+            'JPM': 'FINANCIALS', 'MS': 'FINANCIALS', 'HOOD': 'FINANCIALS',
+
+            # Healthcare
+            'LLY': 'HEALTHCARE',
+
+            # Materials
+            'AA': 'MATERIALS',
+
+            # Broad Market
+            'SPY': 'TECH'  # Default SPY to largest sector weight
+        }
+
+        sector = sector_mapping.get(ticker, 'TECH')
+
+        try:
+            sector_etf = self.sector_etfs[sector]
+            print(f"📊 Analyzing sector strength for {ticker} ({sector} - {sector_etf})")
+
+            # Get sector ETF data with error handling
+            sector_data = None
+            for period in ["30d", "60d", "90d"]:  # Try different periods if one fails
+                try:
+                    sector_data = yf.download(sector_etf, period=period, interval="1d", progress=False)
+                    if not sector_data.empty and len(sector_data) >= 10:
+                        print(f"✅ Retrieved {len(sector_data)} days of {sector_etf} data")
+                        break
+                except Exception as e:
+                    print(f"⚠️ Failed to get {period} data for {sector_etf}: {e}")
+                    continue
+
+            if sector_data is None or sector_data.empty:
+                print(f"❌ No sector data available for {sector_etf}, using neutral strength")
+                return 0.5
+
+            # Calculate sector performance (use available data length)
+            available_days = min(20, len(sector_data) - 1)
+            if available_days < 5:
+                print(f"⚠️ Insufficient data ({available_days} days) for {sector_etf}")
+                return 0.5
+
+            # FIX: Extract scalar values to avoid Series formatting issues
+            sector_current = float(sector_data['Close'].iloc[-1])
+            sector_past = float(sector_data['Close'].iloc[-available_days - 1])
+            sector_return = (sector_current / sector_past) - 1
+
+            # Get SPY for comparison (cache to avoid repeated downloads)
+            if self.spy_cache is None:
+                try:
+                    spy_data = yf.download("SPY", period="60d", interval="1d", progress=False)
+                    if not spy_data.empty:
+                        self.spy_cache = spy_data
+                        print(f"✅ Retrieved SPY data for comparison ({len(spy_data)} days)")
+                    else:
+                        print("⚠️ No SPY data available")
+                        return 0.5
+                except Exception as e:
+                    print(f"❌ Failed to get SPY data: {e}")
+                    return 0.5
+
+            spy_data = self.spy_cache
+            spy_available_days = min(available_days, len(spy_data) - 1)
+
+            # FIX: Extract scalar values to avoid Series formatting issues
+            spy_current = float(spy_data['Close'].iloc[-1])
+            spy_past = float(spy_data['Close'].iloc[-spy_available_days - 1])
+            spy_return = (spy_current / spy_past) - 1
+
+            # Calculate relative strength
+            relative_strength = sector_return - spy_return
+
+            # FIX: Now all variables are scalar floats, formatting will work
+            print(
+                f"📈 {sector_etf}: {sector_return * 100:.1f}% vs SPY: {spy_return * 100:.1f}% = Relative: {relative_strength * 100:.1f}%")
+
+            # Normalize to 0-1 scale with more realistic bounds
+            # Relative performance typically ranges from -15% to +15% over 20 days
+            # Map this range to 0-1 scale
+            min_relative = -0.15  # -15% underperformance = 0
+            max_relative = 0.15  # +15% outperformance = 1
+
+            strength = (relative_strength - min_relative) / (max_relative - min_relative)
+            strength = max(0.0, min(1.0, strength))  # Clamp to [0,1]
+
+            print(f"✅ {ticker} final sector strength: {strength * 100:.1f}%")
+            return strength
+
+        except Exception as e:
+            print(f"❌ Sector analysis failed for {ticker}: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0.5  # Default neutral
+
+
+def calculate_position_sizing(confidence, option_price, max_risk_per_trade=100):
+    """Calculate position size based on confidence and Kelly Criterion"""
+
+    # Kelly Criterion: f = (bp - q) / b
+    # where b = odds, p = win probability, q = loss probability
+
+    win_prob = confidence
+    loss_prob = 1 - confidence
+
+    # Assume average winner makes 100% (2x), average loser loses 100%
+    avg_win = 1.0
+    avg_loss = 1.0
+
+    # Kelly fraction
+    kelly_fraction = (win_prob * avg_win - loss_prob * avg_loss) / avg_win
+    kelly_fraction = max(0.01, min(0.25, kelly_fraction))  # Cap at 25%
+
+    # Position size
+    position_size = int((max_risk_per_trade * kelly_fraction) / option_price)
+
+    return max(1, position_size)
+
+
+# --- Main Analysis ---
+print("🔍 Initializing Advanced Options Engine v4.0...")
+
+# Initialize components
+regime_detector = MarketRegimeDetector()
+market_regime = regime_detector.detect_regime()
+confidence_calc = AdvancedConfidenceCalculator(market_regime)
+sector_analyzer = SectorAnalyzer()
+
+print(
+    f"📊 Market Regime: {market_regime['regime']} | VIX: {market_regime['vix']} | SPY 20d: {market_regime['spy_20d_return']}%")
+
+results = []
+
+# Sort stocks alphabetically for consistent processing order
+sorted_stocks = sorted(stocks)
+print(f"Processing stocks in alphabetical order: {sorted_stocks}")
+
+for ticker in sorted_stocks:
+    print(f"\n🔄 Processing {ticker}...")
+
+    try:
+        data = yf.download(ticker, period=f"{lookback_years}y", interval="1d", progress=False)
+        data.dropna(inplace=True)
+
+        if len(data) < 50:
+            print(f"⚠️ Insufficient data for {ticker}, skipping...")
+            continue
+
+    except Exception as e:
+        print(f"❌ Failed to download data for {ticker}: {e}")
+        continue
+
+    # Technical indicators (same as before)
+    data['SMA_5'] = data['Close'].rolling(sma_short).mean()
+    data['SMA_10'] = data['Close'].rolling(sma_mid).mean()
+    data['SMA_20'] = data['Close'].rolling(sma_long).mean()
+
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(rsi_period).mean()
+    avg_loss = loss.rolling(rsi_period).mean()
+    rs = avg_gain / avg_loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+
+    data['EMA_fast'] = data['Close'].ewm(span=macd_fast, adjust=False).mean()
+    data['EMA_slow'] = data['Close'].ewm(span=macd_slow, adjust=False).mean()
+    data['MACD'] = data['EMA_fast'] - data['EMA_slow']
+    data['MACD_Signal'] = data['MACD'].ewm(span=macd_signal, adjust=False).mean()
+
+    data['Daily_Return'] = data['Close'].pct_change()
+    volatility_series = data['Daily_Return'].rolling(20).std()
+
+    if len(volatility_series) == 0 or pd.isna(volatility_series.iloc[-1]):
+        avg_volatility = 0.02
+    else:
+        avg_volatility = volatility_series.iloc[-1]
+
+    current = data.iloc[-1]
+    current_price = round(float(current['Close'].item()), 2)
+
+    pattern = {
+        'SMA_diff_5_20': float((current['SMA_5'] - current['SMA_20']).item()),
+        'SMA_diff_10_20': float((current['SMA_10'] - current['SMA_20']).item()),
+        'RSI': float(current['RSI'].item()),
+        'MACD_diff': float((current['MACD'] - current['MACD_Signal']).item())
+    }
+
+    # Find similar patterns
+    history = data.iloc[:-20].copy()
+    history['SMA_diff_5_20'] = history['SMA_5'] - history['SMA_20']
+    history['SMA_diff_10_20'] = history['SMA_10'] - history['SMA_20']
+    history['MACD_diff'] = history['MACD'] - history['MACD_Signal']
+    history['distance'] = ((history['SMA_diff_5_20'] - pattern['SMA_diff_5_20']) ** 2 +
+                           (history['SMA_diff_10_20'] - pattern['SMA_diff_10_20']) ** 2 +
+                           (history['RSI'] - pattern['RSI']) ** 2 +
+                           (history['MACD_diff'] - pattern['MACD_diff']) ** 2) ** 0.5
+
+    similar = history.nsmallest(40, 'distance')  # More samples for better statistics
+
+    # Multi-timeframe analysis
+    tf_analyzer = MultiTimeframeAnalyzer(data)
+    timeframe_results = tf_analyzer.analyze_pattern_across_timeframes(similar.index)
+
+    if not timeframe_results:
+        continue
+
+    # Get sector strength
+    sector_strength = sector_analyzer.get_sector_strength(ticker)
+
+    # Options analysis
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        expirations = ticker_obj.options
+        if not expirations:
+            print(f"⚠️ No options data available for {ticker}")
+            continue
+    except Exception as e:
+        print(f"❌ Failed to get options data for {ticker}: {e}")
+        continue
+
+    option_candidates = []
+
+    for expiry in expirations[:8]:  # Check more expirations
+        try:
+            expiry_date = pd.to_datetime(expiry).date()
+            days_out = (expiry_date - today).days
+
+            if days_out < 1 or days_out > 60:
+                continue
+
+            chain = ticker_obj.option_chain(expiry)
+
+            for signal_type in ["CALL", "PUT"]:
+                option_table = chain.calls if signal_type == "CALL" else chain.puts
+                option_table = option_table[(option_table['lastPrice'] >= min_option_price) &
+                                            (option_table['lastPrice'] <= max_option_price) &
+                                            (option_table['volume'] > min_liquidity_volume)]
+
+                if option_table.empty:
+                    continue
+
+                # Sample different strike ranges
+                for _, opt in option_table.sample(min(3, len(option_table)), random_state=1).iterrows():
+                    strike_price = opt['strike']
+
+                    confidence, breakdown = confidence_calc.calculate_enhanced_confidence(
+                        timeframe_results, current_price, strike_price, signal_type,
+                        days_out, avg_volatility, sector_strength
+                    )
+
+                    position_size = calculate_position_sizing(confidence, opt['lastPrice'])
+
+                    entry = {
+                        'Ticker': ticker,
+                        'Signal': signal_type,
+                        'Confidence': f"{round(confidence * 100, 1)}%",
+                        'Market Regime': market_regime['regime'],
+                        'Sector Strength': f"{round(sector_strength * 100, 1)}%",
+                        'Current Price': f"${current_price}",
+                        'Strike': strike_price,
+                        'Moneyness': f"{round(abs(strike_price - current_price) / current_price * 100, 1)}%",
+                        'Expiry': expiry_date,
+                        'Days Out': days_out,
+                        'Option Price': f"${opt['lastPrice']}",
+                        'Suggested Size': position_size,
+                        'Volume': opt['volume'],
+                        'IV': f"{round(opt['impliedVolatility'] * 100, 1)}%",
+                        'Pattern Sharpe': breakdown['pattern_sharpe'],
+                        'Expected Return': f"{breakdown['expected_return']}%",
+                        'Date': today
+                    }
+
+                    option_candidates.append((confidence, entry))
+
+        except Exception as e:
+            continue
+
+    # Sort by confidence and take top options
+    option_candidates.sort(key=lambda x: x[0], reverse=True)
+    results.extend([entry for _, entry in option_candidates[:ideas_per_stock]])
+
+# Enhanced Output with Alphabetical Sorting
+results_df = pd.DataFrame(results)
+if results_df.empty:
+    print("⚠️ No option signals generated.")
+else:
+    # Sort by Ticker alphabetically, then by confidence
+    results_df['Confidence_Numeric'] = results_df['Confidence'].str.rstrip('%').astype(float)
+    results_df = results_df.sort_values(['Ticker', 'Confidence_Numeric'], ascending=[True, False])
+    results_df = results_df.drop('Confidence_Numeric', axis=1)
+
+    print(f"\n🎯 ADVANCED OPTIONS SIGNALS - Market Regime: {market_regime['regime']}")
+    print("=" * 120)
+    print(results_df.to_string(index=False))
+
+    # Advanced Analytics
+    high_conf = results_df[results_df['Confidence'].str.rstrip('%').astype(float) > 70]
+
+    print(f"\n📈 ADVANCED ANALYTICS:")
+    print(f"Total signals: {len(results_df)} | High confidence (>70%): {len(high_conf)}")
+    print(f"Average confidence: {results_df['Confidence'].str.rstrip('%').astype(float).mean():.1f}%")
+    print(f"Market regime bias: {market_regime['regime']} (VIX: {market_regime['vix']})")
+
+    # Signal distribution
+    call_signals = len(results_df[results_df['Signal'] == 'CALL'])
+    put_signals = len(results_df[results_df['Signal'] == 'PUT'])
+    print(f"Signal distribution: {call_signals} CALLS, {put_signals} PUTS")
+
+    print(f"\n🏆 TOP 10 HIGHEST CONFIDENCE PLAYS:")
+    # For top 10, sort by confidence regardless of ticker
+    top_10_df = results_df.copy()
+    top_10_df['Confidence_Numeric'] = top_10_df['Confidence'].str.rstrip('%').astype(float)
+    top_10_df = top_10_df.sort_values('Confidence_Numeric', ascending=False)
+    top_10 = top_10_df.head(10)[
+        ['Ticker', 'Signal', 'Confidence', 'Strike', 'Current Price', 'Option Price', 'Expiry', 'Days Out', 'Suggested Size', 'Market Regime']]
+    print(top_10.to_string(index=False))
