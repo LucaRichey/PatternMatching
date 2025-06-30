@@ -1,0 +1,470 @@
+# Enhanced Options Income Strategy Engine with Debug Features
+import warnings
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import datetime as dt
+from datetime import timedelta
+import random
+from scipy import stats
+from collections import defaultdict
+
+# --- Enhanced Settings with Debug Mode ---
+DEBUG_MODE = True  # Set to True for detailed debug output
+stocks = ["TQQQ", "NVDA", "TSLA", "SPY", "HOOD", "PLTR", "SPOT", "META", "AMZN", "AA", "MSFT", "MS", "JPM", "CRM",
+          "AAPL", "AMD", "WMT", "MRVL", "LLY"]  # Reduced list for testing
+lookback_years = 1  # Reduced for faster testing
+ideas_per_stock = 3
+
+# --- Portfolio Settings ---
+PORTFOLIO_VALUE = 100000
+CASH_ALLOCATION = 0.3
+EQUITY_ALLOCATION = 0.7
+MIN_YIELD_TARGET = 0.5  # Reduced from 1.0% to catch more opportunities
+MAX_DAYS_TO_EXPIRY = 60  # Increased range
+MIN_DAYS_TO_EXPIRY = 3  # Reduced minimum
+VIX_THRESHOLD_LOW = 15
+VIX_THRESHOLD_HIGH = 30
+MARKET_INDICES = ["SPY", "QQQ", "IWM"]
+
+# --- Technical Settings ---
+min_option_premium = 0.10  # Reduced from 0.30
+min_liquidity_volume = 1  # Reduced from 10
+
+today = dt.datetime.now().date()
+
+
+class MarketRegimeDetector:
+    def __init__(self):
+        self.regime_cache = {}
+
+    def detect_regime(self):
+        """Detect current market regime with fallback"""
+        try:
+            if DEBUG_MODE:
+                print("🔍 Detecting market regime...")
+
+            # Simplified VIX detection with multiple fallbacks
+            vix = 20.0  # Default fallback
+
+            try:
+                # Try to get VIX data
+                vix_data = yf.download("^VIX", period="5d", interval="1d", progress=False)
+                if not vix_data.empty and 'Close' in vix_data.columns:
+                    vix = float(vix_data['Close'].iloc[-1])
+                    if DEBUG_MODE:
+                        print(f"✅ VIX retrieved: {vix:.2f}")
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"⚠️ VIX fetch failed, using default: {e}")
+
+            # Get SPY data for trend analysis
+            try:
+                spy_data = yf.download("SPY", period="20d", interval="1d", progress=False)
+                if not spy_data.empty:
+                    spy_returns = spy_data['Close'].pct_change(10).iloc[-1]
+                    spy_vol = spy_data['Close'].pct_change().rolling(10).std().iloc[-1] * np.sqrt(252)
+                else:
+                    spy_returns = 0.0
+                    spy_vol = 0.20
+            except:
+                spy_returns = 0.0
+                spy_vol = 0.20
+
+            # Simplified regime detection
+            if vix > 30:
+                regime = "VOLATILE"
+            elif vix > 25:
+                regime = "BEAR" if spy_returns < -0.02 else "VOLATILE"
+            elif vix < 15:
+                regime = "BULL" if spy_returns > -0.02 else "SIDEWAYS"
+            else:
+                regime = "NEUTRAL"
+
+            if DEBUG_MODE:
+                print(f"📊 Market regime: {regime}, VIX: {vix:.1f}, SPY return: {spy_returns * 100:.1f}%")
+
+            return {
+                'regime': regime,
+                'vix': round(vix, 2),
+                'spy_20d_return': round(spy_returns * 100, 2) if spy_returns else 0,
+                'market_vol': round(spy_vol * 100, 2) if spy_vol else 20
+            }
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"❌ Market regime detection failed: {e}")
+            return {'regime': 'NEUTRAL', 'vix': 20, 'spy_20d_return': 0, 'market_vol': 20}
+
+
+class IncomeStrategyAnalyzer:
+    def __init__(self, market_regime):
+        self.market_regime = market_regime
+
+    def analyze_covered_call_attractiveness(self, data, current_price, strike_price,
+                                        option_premium, days_to_expiry, dividend_yield=0, iv=None):
+        try:
+            monthly_yield = (option_premium / current_price) * (30 / max(days_to_expiry, 1)) * 100
+            annualized_yield = monthly_yield * 12
+            upside_if_assigned = max(0, ((strike_price - current_price) / current_price) * 100)
+
+            moneyness = strike_price / current_price
+            if moneyness > 1.05:
+                assignment_prob = 20
+            elif moneyness > 1.02:
+                assignment_prob = 35
+            elif moneyness > 0.98:
+                assignment_prob = 50
+            else:
+                assignment_prob = 70
+
+            recent_low = data['Close'].rolling(10).min().iloc[-1]
+            downside_protection = max(0, ((current_price - recent_low) / current_price) * 100)
+
+            attractiveness = (
+                    min(monthly_yield * 3, 30) +
+                    min(downside_protection * 0.5, 15) +
+                    min(upside_if_assigned, 10) +
+                    20
+            )
+
+            return {
+                'attractiveness_score': min(100, attractiveness),
+                'monthly_yield': round(monthly_yield, 2),
+                'annualized_yield': round(annualized_yield, 1),
+                'assignment_probability': assignment_prob,
+                'total_return_if_assigned': round(monthly_yield + upside_if_assigned, 2),
+                'downside_protection': round(downside_protection, 1),
+                'upside_if_assigned': round(upside_if_assigned, 1)
+            }
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"Error in CC analysis: {e}")
+            return None
+
+    def analyze_csp_attractiveness(self, data, current_price, strike_price,
+                               option_premium, days_to_expiry, dividend_yield=0, iv=None):
+        try:
+            monthly_yield = (option_premium / strike_price) * (30 / max(days_to_expiry, 1)) * 100
+            annualized_yield = monthly_yield * 12
+
+            effective_price = strike_price - option_premium
+            discount_to_current = ((current_price - effective_price) / current_price) * 100
+
+            moneyness = current_price / strike_price
+            if moneyness > 1.05:
+                assignment_prob = 20
+            elif moneyness > 1.02:
+                assignment_prob = 35
+            elif moneyness > 0.98:
+                assignment_prob = 50
+            else:
+                assignment_prob = 70
+
+            recent_low = data['Close'].rolling(10).min().iloc[-1]
+            strike_vs_support = ((strike_price - recent_low) / recent_low) * 100
+
+            attractiveness = (
+                    min(monthly_yield * 3, 30) +
+                    min(max(discount_to_current, 0), 15) +
+                    min(max(strike_vs_support, 0), 10) +
+                    20
+            )
+
+            return {
+                'attractiveness_score': min(100, attractiveness),
+                'monthly_yield': round(monthly_yield, 2),
+                'annualized_yield': round(annualized_yield, 1),
+                'assignment_probability': assignment_prob,
+                'effective_purchase_price': round(effective_price, 2),
+                'discount_to_current': round(discount_to_current, 1),
+                'strike_vs_support': round(strike_vs_support, 1)
+            }
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"Error in CSP analysis: {e}")
+            return None
+
+
+def calculate_position_size_income(strategy_type, current_price, option_premium,
+                                   portfolio_value, cash_allocation, equity_allocation):
+    """Simplified position sizing"""
+    if strategy_type == "COVERED_CALL":
+        max_equity = portfolio_value * equity_allocation
+        cost_per_contract = current_price * 100
+        max_contracts = max(1, int(max_equity * 0.05 / cost_per_contract))  # 5% per position
+    else:  # CSP
+        max_cash = portfolio_value * cash_allocation
+        max_contracts = max(1, int(max_cash * 0.1 / (current_price * 100)))  # 10% per position
+
+    return min(max_contracts, 5)  # Cap at 5 contracts
+
+
+def get_dividend_yield(ticker_obj):
+    """Safe dividend yield retrieval"""
+    try:
+        info = ticker_obj.info
+        div_yield = info.get('dividendYield', 0)
+        if div_yield and div_yield > 0:
+            return div_yield * 100
+    except:
+        pass
+    return 0
+
+
+# --- Main Analysis ---
+print("🔍 Initializing Debug Options Income Engine...")
+
+# Initialize components
+regime_detector = MarketRegimeDetector()
+market_regime = regime_detector.detect_regime()
+income_analyzer = IncomeStrategyAnalyzer(market_regime)
+
+print(f"📊 Market Regime: {market_regime['regime']} | VIX: {market_regime['vix']}")
+print(f"💰 Portfolio: ${PORTFOLIO_VALUE:,} | Min Yield: {MIN_YIELD_TARGET}% | Min Premium: ${min_option_premium}")
+
+covered_calls = []
+cash_secured_puts = []
+debug_info = []
+
+for ticker in stocks:
+    print(f"\n🔄 Processing {ticker}...")
+
+    try:
+        # Get stock data
+        data = yf.download(ticker, period=f"{lookback_years}y", interval="1d", progress=False)
+        if data.empty or len(data) < 20:
+            if DEBUG_MODE:
+                print(f"❌ Insufficient data for {ticker}")
+            continue
+
+        ticker_obj = yf.Ticker(ticker)
+        current_price = float(data['Close'].iloc[-1])
+        dividend_yield = get_dividend_yield(ticker_obj)
+
+        if DEBUG_MODE:
+            print(f"✅ {ticker}: Price=${current_price:.2f}, Div={dividend_yield:.1f}%")
+
+        # Get options expirations
+        try:
+            expirations = ticker_obj.options
+            if not expirations:
+                if DEBUG_MODE:
+                    print(f"⚠️ No options for {ticker}")
+                continue
+        except Exception as e:
+            if DEBUG_MODE:
+                print(f"❌ Options fetch failed for {ticker}: {e}")
+            continue
+
+        options_found = 0
+
+        # Check each expiration
+        for expiry in expirations[:4]:  # Check first 4 expirations
+            try:
+                expiry_date = pd.to_datetime(expiry).date()
+                days_out = (expiry_date - today).days
+
+                if days_out < MIN_DAYS_TO_EXPIRY or days_out > MAX_DAYS_TO_EXPIRY:
+                    continue
+
+                if DEBUG_MODE:
+                    print(f"  📅 Checking expiry {expiry} ({days_out} days out)")
+
+                # Get option chain
+                try:
+                    chain = ticker_obj.option_chain(expiry)
+                except Exception as e:
+                    if DEBUG_MODE:
+                        print(f"    ❌ Chain fetch failed: {e}")
+                    continue
+
+                # COVERED CALLS
+                calls = chain.calls
+                if not calls.empty:
+                    # Filter calls
+                    good_calls = calls[
+                        (calls['lastPrice'] >= min_option_premium) &
+                        (calls['volume'] >= min_liquidity_volume) &
+                        (calls['strike'] >= current_price * 0.95) &
+                        (calls['strike'] <= current_price * 1.20)
+                        ]
+
+                    if DEBUG_MODE and not good_calls.empty:
+                        print(f"    📈 Found {len(good_calls)} potential calls")
+
+                    for _, call_opt in good_calls.head(3).iterrows():  # Limit to top 3
+                        strike_price = call_opt['strike']
+                        option_premium = call_opt['lastPrice']
+
+                        analysis = income_analyzer.analyze_covered_call_attractiveness(
+                            data, current_price, strike_price, option_premium, days_out, dividend_yield
+                        )
+
+                        if analysis and analysis['attractiveness_score'] >= 30 and analysis[
+                            'monthly_yield'] >= MIN_YIELD_TARGET:
+                            position_size = calculate_position_size_income(
+                                "COVERED_CALL", current_price, option_premium,
+                                PORTFOLIO_VALUE, CASH_ALLOCATION, EQUITY_ALLOCATION
+                            )
+
+                            entry = {
+                                'Ticker': ticker,
+                                'Strategy': 'COVERED CALL',
+                                'Current Price': f"${current_price:.2f}",
+                                'Strike': strike_price,
+                                'Premium': f"${option_premium:.2f}",
+                                'Expiry': expiry_date,
+                                'Days Out': days_out,
+                                'Monthly Yield': f"{analysis['monthly_yield']:.2f}%",
+                                'Annualized Yield': f"{analysis['annualized_yield']:.1f}%",
+                                'Assignment Prob': f"{analysis['assignment_probability']:.0f}%",
+                                'Attractiveness': round(analysis['attractiveness_score'], 1),
+                                'Suggested Contracts': position_size,
+                                'Monthly Income': f"${option_premium * 100 * position_size:.0f}",
+                                'IV': f"{call_opt.get('impliedVolatility', 0) * 100:.1f}%",
+                                'Volume': call_opt.get('volume', 0)
+                            }
+
+                            covered_calls.append((analysis['attractiveness_score'], entry))
+                            options_found += 1
+
+                            if DEBUG_MODE:
+                                print(
+                                    f"    ✅ CC: Strike ${strike_price}, Premium ${option_premium:.2f}, Yield {analysis['monthly_yield']:.2f}%")
+
+                # CASH-SECURED PUTS
+                puts = chain.puts
+                if not puts.empty:
+                    # Filter puts
+                    good_puts = puts[
+                        (puts['lastPrice'] >= min_option_premium) &
+                        (puts['volume'] >= min_liquidity_volume) &
+                        (puts['strike'] >= current_price * 0.80) &
+                        (puts['strike'] <= current_price * 1.05)
+                        ]
+
+                    if DEBUG_MODE and not good_puts.empty:
+                        print(f"    📉 Found {len(good_puts)} potential puts")
+
+                    for _, put_opt in good_puts.head(3).iterrows():  # Limit to top 3
+                        strike_price = put_opt['strike']
+                        option_premium = put_opt['lastPrice']
+
+                        analysis = income_analyzer.analyze_csp_attractiveness(
+                            data, current_price, strike_price, option_premium, days_out, dividend_yield
+                        )
+
+                        if analysis and analysis['attractiveness_score'] >= 30 and analysis[
+                            'monthly_yield'] >= MIN_YIELD_TARGET:
+                            position_size = calculate_position_size_income(
+                                "CASH_SECURED_PUT", strike_price, option_premium,
+                                PORTFOLIO_VALUE, CASH_ALLOCATION, EQUITY_ALLOCATION
+                            )
+
+                            entry = {
+                                'Ticker': ticker,
+                                'Strategy': 'CASH-SECURED PUT',
+                                'Current Price': f"${current_price:.2f}",
+                                'Strike': strike_price,
+                                'Premium': f"${option_premium:.2f}",
+                                'Expiry': expiry_date,
+                                'Days Out': days_out,
+                                'Monthly Yield': f"{analysis['monthly_yield']:.2f}%",
+                                'Annualized Yield': f"{analysis['annualized_yield']:.1f}%",
+                                'Assignment Prob': f"{analysis['assignment_probability']:.0f}%",
+                                'Effective Purchase': f"${analysis['effective_purchase_price']:.2f}",
+                                'Attractiveness': round(analysis['attractiveness_score'], 1),
+                                'Suggested Contracts': position_size,
+                                'Monthly Income': f"${option_premium * 100 * position_size:.0f}",
+                                'IV': f"{put_opt.get('impliedVolatility', 0) * 100:.1f}%",
+                                'Volume': put_opt.get('volume', 0)
+                            }
+
+                            cash_secured_puts.append((analysis['attractiveness_score'], entry))
+                            options_found += 1
+
+                            if DEBUG_MODE:
+                                print(
+                                    f"    ✅ CSP: Strike ${strike_price}, Premium ${option_premium:.2f}, Yield {analysis['monthly_yield']:.2f}%")
+
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"    ❌ Error processing expiry {expiry}: {e}")
+                continue
+
+        debug_info.append({
+            'Ticker': ticker,
+            'Price': current_price,
+            'Options Found': options_found,
+            'Expirations Available': len(expirations) if expirations else 0
+        })
+
+    except Exception as e:
+        if DEBUG_MODE:
+            print(f"❌ Failed processing {ticker}: {e}")
+        continue
+
+# Sort results
+covered_calls.sort(key=lambda x: x[0], reverse=True)
+cash_secured_puts.sort(key=lambda x: x[0], reverse=True)
+
+# Create DataFrames
+covered_calls_df = pd.DataFrame([entry for _, entry in covered_calls])
+cash_secured_puts_df = pd.DataFrame([entry for _, entry in cash_secured_puts])
+
+# Output Results
+print(f"\n🎯 RESULTS SUMMARY")
+print("=" * 80)
+print(f"Market Regime: {market_regime['regime']}")
+print(f"Covered Calls Found: {len(covered_calls_df)}")
+print(f"Cash-Secured Puts Found: {len(cash_secured_puts_df)}")
+
+if DEBUG_MODE:
+    print(f"\n📊 DEBUG INFO:")
+    debug_df = pd.DataFrame(debug_info)
+    if not debug_df.empty:
+        print(debug_df.to_string(index=False))
+
+# Display results
+if not covered_calls_df.empty:
+    print(f"\n📈 COVERED CALLS:")
+    print("-" * 120)
+    display_cols = ['Ticker', 'Strike', 'Premium', 'Monthly Yield', 'Annualized Yield',
+                    'Assignment Prob', 'Attractiveness', 'Monthly Income', 'Days Out']
+    print(covered_calls_df[display_cols].to_string(index=False))
+
+if not cash_secured_puts_df.empty:
+    print(f"\n📉 CASH-SECURED PUTS:")
+    print("-" * 120)
+    display_cols = ['Ticker', 'Strike', 'Premium', 'Monthly Yield', 'Annualized Yield',
+                    'Assignment Prob', 'Effective Purchase', 'Attractiveness', 'Monthly Income', 'Days Out']
+    print(cash_secured_puts_df[display_cols].to_string(index=False))
+
+# Calculate totals
+total_cc_income = 0
+total_csp_income = 0
+
+if not covered_calls_df.empty:
+    cc_income = covered_calls_df['Monthly Income'].str.replace('$', '').str.replace(',', '').astype(float)
+    total_cc_income = cc_income.sum()
+
+if not cash_secured_puts_df.empty:
+    csp_income = cash_secured_puts_df['Monthly Income'].str.replace('$', '').str.replace(',', '').astype(float)
+    total_csp_income = csp_income.sum()
+
+print(f"\n💰 INCOME SUMMARY:")
+print(f"Total Monthly Income: ${total_cc_income + total_csp_income:,.0f}")
+print(f"Covered Calls Income: ${total_cc_income:,.0f}")
+print(f"Cash-Secured Puts Income: ${total_csp_income:,.0f}")
+
+if not covered_calls_df.empty or not cash_secured_puts_df.empty:
+    print(f"\n✅ Found {len(covered_calls_df) + len(cash_secured_puts_df)} total opportunities!")
+else:
+    print(f"\n⚠️ No opportunities found. Try:")
+    print("- Lowering MIN_YIELD_TARGET")
+    print("- Lowering min_option_premium")
+    print("- Increasing MAX_DAYS_TO_EXPIRY")
+    print("- Adding more liquid stocks to the list")
